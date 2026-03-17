@@ -1,0 +1,59 @@
+services:
+
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Madrid
+    volumes:
+      - ./config/radarr:/config
+      - /ruta/descargas/Incoming:/downloads
+      - /ruta/media/movies:/movies
+    ports:
+      - "7878:7878"
+    restart: unless-stopped
+
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Madrid
+    volumes:
+      - ./config/sonarr:/config
+      - /ruta/descargas/Incoming:/downloads
+      - /ruta/media/series:/series
+    ports:
+      - "8989:8989"
+    restart: unless-stopped
+
+  ed2k-indexer:
+    image: python:3.11-slim
+    container_name: ed2k-indexer
+    environment:
+      - INDEXER_USER=${INDEXER_USER}
+      - INDEXER_PASS=${INDEXER_PASS}
+      - INDEXER_BASE_URL=${INDEXER_BASE_URL}
+      - EMULE_HOST=host-gateway
+      - EMULE_PORT=4711
+      - EMULE_PASS=${EMULE_PASS}
+      - TMDB_API_KEY=${TMDB_API_KEY}
+      - OMDB_API_KEY=${OMDB_API_KEY}
+      - TORZNAB_APIKEY=${TORZNAB_APIKEY}
+      - PORT=8085
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./ed2k-indexer:/app
+      - /ruta/descargas/watch:/watch
+      - /ruta/descargas/Incoming:/downloads
+    working_dir: /app
+    command: >
+      sh -c "pip install requests beautifulsoup4 flask -q && python torznab_server.py"
+    ports:
+      - "8085:8085"
+    extra_hosts:
+      - "host-gateway:host-gateway"
+    restart: unless-stopped
