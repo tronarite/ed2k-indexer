@@ -54,7 +54,7 @@ Quality filtering is handled by Radarr/Sonarr's Quality Profiles — the indexer
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/tu-usuario/ed2k-indexer
+git clone https://github.com/tronarite/ed2k-indexer
 cd ed2k-indexer
 ```
 
