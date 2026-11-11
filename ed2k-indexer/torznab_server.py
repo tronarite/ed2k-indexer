@@ -17,10 +17,28 @@ API_KEY    = os.environ.get("TORZNAB_APIKEY", "hispashare123")
 EMULE_HOST = os.environ.get("EMULE_HOST", "host-gateway")
 EMULE_PORT = int(os.environ.get("EMULE_PORT", "4711"))
 BLACKHOLE  = "/watch"   # G:\emuleDescargas\watch en el host
+# Claves externas: definidas por entorno (TMDB_API_KEY / OMDB_API_KEY)
+TMDB_KEY   = os.environ.get("TMDB_API_KEY", "")
+OMDB_KEY   = os.environ.get("OMDB_API_KEY", "")
 
 os.makedirs(BLACKHOLE, exist_ok=True)
 
 _session = None
+
+import time as _time, threading as _threading
+_http_cache = {}
+def http_json(url, timeout=5, ttl=21600):
+    """GET JSON con cache en memoria (TMDB/OMDb). Los fallos no se cachean."""
+    now = _time.time()
+    hit = _http_cache.get(url)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    j = requests.get(url, timeout=timeout).json()
+    if isinstance(j, dict) and not j.get("status_code") and j.get("Response") != "False":
+        if len(_http_cache) > 2000:
+            _http_cache.clear()
+        _http_cache[url] = (now, j)
+    return j
 
 def is_logged_in(session):
     """Verifica si la sesion sigue activa comprobando la cookie HSLOGIN."""
@@ -101,6 +119,9 @@ def detect_quality(fname):
     """
     f = fname.upper()
 
+    # Detectar 3D antes que nada
+    is_3d = bool(re.search(r'\.3D\.|3D\.SBS|3D\.HOU|HSBS|HTAB|\bSBS\b|\bHOU\b|3D\.BLURAY|BLURAY\.3D', f))
+
     # Resolución — orden importante: más específico primero
     if re.search(r'2160P|MICRO4K|\b4K\b|UHDRI P', f):
         res = "2160p"
@@ -114,13 +135,12 @@ def detect_quality(fname):
         res = "1080p"  # Hispashare casi siempre es 1080p
 
     # Fuente → calidad que entiende Radarr
-    # IMPORTANTE: XviD/DivX van primero porque BDrip.XviD es un DVD encode
     if re.search(r'XVID|DIVX|BD\+DVD', f):
-        src = "DVD"                                  # filtrar
+        src = "DVD"
     elif re.search(r'MICRO4K|UHDRIP|UHD.?RIP', f):
-        src = "Bluray-2160p"                         # filtrar
+        src = "Bluray-2160p"
     elif re.search(r'2160P', f):
-        src = "Bluray-2160p"                         # filtrar
+        src = "Bluray-2160p"
     elif re.search(r'BDRIP|BDREMUX|BLU.?RAY|MICROHD|\bMHD\b|BR\+HQTV|BLURAY.RIP', f):
         src = f"Bluray-{res}"
     elif re.search(r'WEB.?DL|WEBDL|\bNFLX\b|\bATVP\b|\bNF\b|\bAPTV\b', f):
@@ -128,13 +148,19 @@ def detect_quality(fname):
     elif re.search(r'WEBRIP|WEB.RIP|\bWEBRIP\b', f):
         src = f"WEBRip-{res}"
     elif re.search(r'HDRIP|HD.?RIP', f):
-        src = f"WEBDL-{res}"                         # HDRip → WEBDL
+        src = f"WEBDL-{res}"
     elif re.search(r'\bHD\b', f):
-        src = f"Bluray-{res}"                        # HD genérico → BDRip
+        src = f"Bluray-{res}"
     elif re.search(r'DVD.?RIP|DIVX', f):
-        src = "DVD"                                  # filtrar
+        src = "DVD"
     else:
-        src = f"WEBRip-{res}"                        # fallback seguro
+        src = f"WEBRip-{res}"
+
+    # Añadir sufijo 3D si se detectó — ponerlo antes de la resolución
+    # para que Radarr lo trate como calidad distinta y no descargue automáticamente
+    if is_3d:
+        # Formato: "Bluray-1080p" -> "Bluray-1080p-3D"  
+        src = src + "-3D"
 
     return res, src
 
@@ -142,9 +168,41 @@ def detect_quality(fname):
 def make_radarr_title(fname, title_en, year):
     """Genera un titulo en formato que Radarr puede parsear."""
     res, src = detect_quality(fname)
-    # Formato: "Movie Title Year Quality" - Radarr lo parsea bien
     src_tag = src.replace("Bluray", "BDRip").replace("WEBDL", "WEB-DL").replace("WEBRip", "WEBRip")
     return f"{title_en} ({year}) {src_tag}"
+
+
+def cat_attrs(src, base, tv=False):
+    """Categorias Torznab: la base mas la especifica por resolucion."""
+    if "2160" in src: sub = 5045 if tv else 2045
+    elif "1080" in src or "720" in src: sub = 5040 if tv else 2040
+    else: sub = 5030 if tv else 2030
+    return [base, str(sub)]
+
+
+def page_args():
+    try:
+        off = max(0, int(request.args.get("offset", 0) or 0))
+    except Exception:
+        off = 0
+    try:
+        lim = int(request.args.get("limit", 0) or 0)
+    except Exception:
+        lim = 0
+    return off, (lim if lim > 0 else None)
+
+
+def finish_feed(rss, ch, items, off, lim):
+    """Aplica offset/limit (Torznab) y añade <torznab:response>."""
+    total = len(items)
+    keep = set(id(i) for i in items[off: (off + lim) if lim else None])
+    for i in items:
+        if id(i) not in keep:
+            ch.remove(i)
+    resp = ET.Element("torznab:response")
+    resp.set("offset", str(off)); resp.set("total", str(total))
+    ch.insert(3, resp)
+    return ET.tostring(rss, encoding="unicode", xml_declaration=True)
 
 
 def build_xml(results, title_en="", year=""):
@@ -155,28 +213,39 @@ def build_xml(results, title_en="", year=""):
     ET.SubElement(ch, "description").text = "Hispashare ed2k indexer"
     ET.SubElement(ch, "link").text = BASE
 
+    # 2160p solo se descarta si hay alguna alternativa que no sea 2160p
+    _4k = ("Bluray-2160p", "WEBRip-2160p", "WEBDL-2160p")
+    only_4k = all(detect_quality(parse_fname(e))[1] in _4k
+                  for r in results for e in r.get("ed2k_links", []))
+
+    _off, _lim = page_args()
+    _items = []
+
     for r in results:
+        # En el RSS cada entrada trae su propio titulo/año y la regla del 4K se aplica por pelicula
+        te_r = r.get("title_en", title_en)
+        yr_r = r.get("year", year)
+        r_only_4k = (all(detect_quality(parse_fname(e))[1] in _4k for e in r.get("ed2k_links", []))
+                     if "title_en" in r else only_4k)
         for ed2k in r.get("ed2k_links", []):
             fname = parse_fname(ed2k)
             size  = parse_size(ed2k)
             res, src = detect_quality(fname)
 
-            # Solo filtrar basura real: subtítulos, NFOs, RAR, 3D, BSO
-            fname_upper = fname.upper()
-            if any(x in fname_upper for x in ["BSO", ".SRT", ".RAR", ".NFO", ".TXT", "SUBTITULO", "MEDIAINFO", ".3D.", "3D.SBS", "3D.HOU", "HSBS", "HTAB"]):
-                print(f"[SKIP] {fname[:60]} (BSO/sub/extra)")
+            # Filtrar 2160p salvo que sea lo unico disponible
+            if src in _4k and not r_only_4k:
+                print(f"[SKIP] {fname[:60]} ({src})")
                 continue
-            # Filtrar archivos sin tamaño real (< 10 MB)
-            try:
-                if int(size) < 10 * 1024 * 1024:
-                    print(f"[SKIP] {fname[:60]} (tamaño {int(size)//1024//1024} MB)")
-                    continue
-            except Exception:
-                pass
+            fname_upper = fname.upper()
 
             # Titulo en formato que Radarr puede parsear (inglés + año + calidad)
-            if title_en and year:
-                title = make_radarr_title(fname, title_en, year)
+            ext_lower = os.path.splitext(fname)[1].lower()
+            is_video = ext_lower in {'.mkv', '.mp4', '.avi', '.mov', '.m4v'}
+            if te_r and yr_r and is_video:
+                title = make_radarr_title(fname, te_r, yr_r)
+            elif te_r and yr_r:
+                # Archivo no video (srt, rar, etc) — usar nombre crudo limpio
+                title = fname.replace(".", " ").replace("_", " ").strip()
             else:
                 title = fname.replace(".", " ").replace("_", " ")
                 title = re.sub(r'\s*\(\d+\)\s*', ' ', title).strip()
@@ -189,70 +258,100 @@ def build_xml(results, title_en="", year=""):
             ET.SubElement(item, "comments").text = r["url"]
 
             enc = ET.SubElement(item, "enclosure")
-            enc.set("url",    f"http://hispashare-indexer:8085/download?ed2k={requests.utils.quote(ed2k)}&apikey={API_KEY}&title={requests.utils.quote(title_en or '')}&year={year or ''}")
+            enc.set("url",    f"http://hispashare-indexer:8085/download?ed2k={requests.utils.quote(ed2k)}&apikey={API_KEY}&title={requests.utils.quote(te_r or '')}&year={yr_r or ''}")
             enc.set("length", size)
             enc.set("type",   "application/x-bittorrent")
 
-            for name, val in [
-                ("category", "2000"),
+            for name, val in ([("category", c) for c in cat_attrs(src, "2000")] + [
                 ("seeders",  "50"),
                 ("peers",    "100"),
                 ("size",     size),
                 ("quality",  src),
-            ]:
+            ]):
                 a = ET.SubElement(item, "torznab:attr")
                 a.set("name", name); a.set("value", val)
 
+            _items.append(item)
             print(f"[XML] {title[:50]} | {src} | {int(size)//1024//1024} MB")
 
-    return ET.tostring(rss, encoding="unicode", xml_declaration=True)
+    return finish_feed(rss, ch, _items, _off, _lim)
 
 
-def build_search_queries(title_es, title_en):
-    """
-    Construye la lista de queries a probar en orden, de más específico a más genérico.
-    La idea: si el título exacto no aparece en Hispashare, buscar con la primera
-    palabra clave y verificar IMDB resultado a resultado (como con Star Wars, Evangelion...).
-    """
-    queries = []
-    seen = set()
+# -- RSS: novedades reales de Hispashare para el sync de Radarr ---------------
+_rss_cache = {"ts": 0, "results": []}
 
-    def add(q):
-        q = q.strip()
-        if q and q.lower() not in seen:
-            seen.add(q.lower())
-            queries.append(q)
-
-    # 1. Título ES completo (sin año al final, sin caracteres raros)
-    add(title_es)
-
-    # 2. Título EN completo (si es diferente y está en ASCII)
-    if title_en and all(ord(c) < 256 for c in title_en):
-        add(title_en)
-
-    # 3. Primera palabra del título ES (sin stopwords ni números sueltos)
-    stopwords = {"the","a","an","de","del","la","el","los","las","una","un"}
-    for title in [title_es, title_en]:
-        if not title:
+def _refresh_rss(max_titles=25):
+    from scraper import make_session, login as hs_login
+    from bs4 import BeautifulSoup as BS
+    s = make_session()
+    if not hs_login(s):
+        print("[RSS] login fallido")
+        return
+    home = s.get(BASE + "/", timeout=15).text
+    soup = BS(home, "html.parser")
+    seen, found = set(), []
+    for a in soup.find_all("a", href=True):
+        m = re.search(r"view=title&id=(\d+)&uid=(\d+)", a["href"])
+        txt = a.get_text(" ", strip=True)
+        if not m or (m.group(1), m.group(2)) in seen or not txt:
             continue
-        words = [w for w in re.sub(r"[^a-zA-Z0-9\s]", " ", title).split()
-                 if len(w) >= 3 and w.lower() not in stopwords]
-        if words:
-            add(words[0])           # solo la primera palabra clave
-            if len(words) >= 2:
-                add(f"{words[0]} {words[1]}")  # dos palabras clave
+        seen.add((m.group(1), m.group(2)))
+        if re.search(r"Temporada|Serie\s+completa", txt, re.I):
+            continue      # series: las atiende tvsearch
+        found.append(f"{BASE}/?view=title&id={m.group(1)}&uid={m.group(2)}")
+    results = []
+    for url in found[:max_titles]:
+        try:
+            imdb, links = get_all_ed2k(s, url)
+            if not imdb or not links:
+                continue
+            j = http_json(f"https://api.themoviedb.org/3/find/tt{imdb}?api_key={TMDB_KEY}&external_source=imdb_id&language=es-ES")
+            mr = j.get("movie_results", [])
+            if not mr:
+                continue
+            en = mr[0].get("original_title", "") or mr[0].get("title", "")
+            if not all(ord(c) < 256 for c in en):
+                en = mr[0].get("title", "") or en
+            yr = (mr[0].get("release_date", "") or "")[:4]
+            if en and yr:
+                results.append({"title": en, "url": url, "ed2k_links": links, "title_en": en, "year": yr})
+        except Exception as e:
+            print(f"[RSS] error en {url}: {e}")
+    _rss_cache["results"] = results
+    _rss_cache["ts"] = _time.time()
+    print(f"[RSS] {len(results)} peliculas en cache")
 
-    return queries
+def _rss_loop():
+    _time.sleep(20)
+    while True:
+        try:
+            _refresh_rss()
+        except Exception as e:
+            print(f"[RSS] error: {e}")
+        _time.sleep(1800)
+
+def rss_latest_movies():
+    """XML con las novedades en cache, o None si aun no hay."""
+    if not _rss_cache["results"]:
+        return None
+    return build_xml(_rss_cache["results"])
+
 
 @app.route("/")
 @app.route("/api")
 def api():
     if request.args.get("apikey","") != API_KEY:
-        return Response("Unauthorized", status=401)
+        return Response('<?xml version="1.0" encoding="UTF-8"?><error code="100" description="Incorrect user credentials"/>',
+                        status=401, mimetype="application/xml")
 
     t      = request.args.get("t", "search")
     query  = request.args.get("q","") or request.args.get("title","")
     imdbid = request.args.get("imdbid","")
+
+    # t=search con categorias de TV (Prowlarr/Seerr): tratarlo como busqueda de series
+    cats = [c for c in request.args.get("cat", "").split(",") if c]
+    if t == "search" and cats and all(c.startswith("5") for c in cats):
+        t = "tvsearch"
 
     # Sonarr usa t=tvsearch
     if t == "tvsearch":
@@ -261,7 +360,8 @@ def api():
         episode = request.args.get("ep","")
         season  = int(season)  if season  else 1
         episode = int(episode) if episode else None
-        return handle_tvsearch(query, tvdbid, season, episode)
+        return handle_tvsearch(query, tvdbid, season, episode,
+                               imdbid=imdbid[2:] if imdbid.startswith("tt") else imdbid)
 
     if t == "caps":
         return Response("""<?xml version="1.0" encoding="UTF-8"?>
@@ -269,16 +369,40 @@ def api():
   <server title="Hispashare ed2k"/>
   <searching>
     <search available="yes" supportedParams="q"/>
-    <movie-search available="yes" supportedParams="q,title,imdbid"/>
-    <tv-search available="yes" supportedParams="q,title,tvdbid,season,ep"/>
+    <movie-search available="yes" supportedParams="q,title,imdbid,tmdbid"/>
+    <tv-search available="yes" supportedParams="q,title,tvdbid,imdbid,season,ep"/>
   </searching>
   <categories>
     <category id="2000" name="Movies">
       <subcat id="2010" name="Movies/Foreign"/>
+      <subcat id="2020" name="Movies/Other"/>
+      <subcat id="2030" name="Movies/SD"/>
+      <subcat id="2040" name="Movies/HD"/>
+      <subcat id="2045" name="Movies/UHD"/>
+      <subcat id="2050" name="Movies/BluRay"/>
+      <subcat id="2060" name="Movies/3D"/>
     </category>
-    <category id="5000" name="TV"/>
+    <category id="5000" name="TV">
+      <subcat id="5020" name="TV/Foreign"/>
+      <subcat id="5030" name="TV/SD"/>
+      <subcat id="5040" name="TV/HD"/>
+      <subcat id="5045" name="TV/UHD"/>
+      <subcat id="5070" name="TV/Anime"/>
+    </category>
   </categories>
 </caps>""", mimetype="application/xml")
+
+    # Radarr v5+ puede mandar tmdbid: resolverlo a imdbid
+    tmdbid = request.args.get("tmdbid", "")
+    if tmdbid.isdigit() and not imdbid:
+        try:
+            ext = http_json(f"https://api.themoviedb.org/3/movie/{tmdbid}/external_ids?api_key={TMDB_KEY}")
+            raw = ext.get("imdb_id", "") or ""
+            if raw.startswith("tt"):
+                imdbid = raw[2:]
+                print(f"[*] tmdbid {tmdbid} -> imdb tt{imdbid}")
+        except Exception as e:
+            print(f"[WARN] tmdbid error: {e}")
 
     # Variables para el titulo en inglés y año (para el XML de Radarr)
     title_en = ""
@@ -287,8 +411,8 @@ def api():
     # Resolver titulo en ESPAÑOL via TMDB, guardando también el inglés
     if imdbid:
         try:
-            find_url = f"https://api.themoviedb.org/3/find/tt{imdbid}?api_key=TU_TMDB_API_KEY&external_source=imdb_id&language=es-ES"
-            j = requests.get(find_url, timeout=5).json()
+            find_url = f"https://api.themoviedb.org/3/find/tt{imdbid}?api_key={TMDB_KEY}&external_source=imdb_id&language=es-ES"
+            j = http_json(find_url)
             tmdb_results = j.get("movie_results", []) or j.get("tv_results", [])
             if tmdb_results:
                 r0 = tmdb_results[0]
@@ -309,7 +433,7 @@ def api():
     # Fallback a OMDb si TMDB no resolvio
     if not query and imdbid:
         try:
-            j = requests.get(f"https://www.omdbapi.com/?i=tt{imdbid}&apikey=TU_OMDB_API_KEY", timeout=5).json()
+            j = http_json(f"https://www.omdbapi.com/?i=tt{imdbid}&apikey={OMDB_KEY}")
             query    = j.get("Title","").strip()
             title_en = query
             year_str = j.get("Year","")[:4]
@@ -334,8 +458,8 @@ def api():
     # Si el query viene en inglés (sin imdbid), traducir via TMDB y obtener imdbid
     if query and not imdbid:
         try:
-            search_url = f"https://api.themoviedb.org/3/search/movie?api_key=TU_TMDB_API_KEY&query={requests.utils.quote(query)}&language=es-ES"
-            j = requests.get(search_url, timeout=5).json()
+            search_url = f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_KEY}&query={requests.utils.quote(query)}&language=es-ES"
+            j = http_json(search_url)
             tmdb_results = j.get("results", [])
             if tmdb_results:
                 r0 = tmdb_results[0]
@@ -347,7 +471,7 @@ def api():
                 # Obtener imdbid desde TMDB para verificacion exacta
                 if tmdb_id:
                     try:
-                        ext = requests.get(f"https://api.themoviedb.org/3/movie/{tmdb_id}/external_ids?api_key=TU_TMDB_API_KEY", timeout=5).json()
+                        ext = http_json(f"https://api.themoviedb.org/3/movie/{tmdb_id}/external_ids?api_key={TMDB_KEY}")
                         imdb_from_tmdb = ext.get("imdb_id","")
                         if imdb_from_tmdb and imdb_from_tmdb.startswith("tt"):
                             imdbid = imdb_from_tmdb[2:]
@@ -361,6 +485,9 @@ def api():
             print(f"[WARN] TMDB search error: {e}")
 
     if not query and not imdbid:
+        feed = rss_latest_movies()
+        if feed:
+            return Response(feed, mimetype="application/xml")
         dummy_xml = """<?xml version='1.0' encoding='utf-8'?>
 <rss xmlns:torznab="http://torznab.com/schemas/2015/feed" version="2.0">
 <channel>
@@ -448,17 +575,39 @@ def api():
                                     "ed2k_links": links, "page_imdb": page_imdb})
             return res
 
-        # Construir lista de queries: título completo primero, luego keyword corta
-        search_queries = build_search_queries(query, title_en)
-        print(f"[*] Queries a probar: {search_queries}")
-
-        results = []
-        for sq in search_queries:
-            print(f"[*] Probando: '{sq}'")
-            results = do_search(sq, target_imdb=imdbid if imdbid else None)
-            if results:
-                print(f"[*] Match con query: '{sq}'")
-                break
+        if imdbid:
+            # Buscar con titulo ES, verificando IMDB en cada pagina antes de extraer elinks
+            results = do_search(query, target_imdb=imdbid)
+            # Si no encontro nada, reintentar con titulo EN
+            if not results and title_en and title_en.lower() != query.lower():
+                print(f"[*] Sin match en ES, reintentando EN: '{title_en}'")
+                results = do_search(title_en, target_imdb=imdbid)
+            # Si sigue sin resultados, busqueda progresiva por palabras clave
+            if not results:
+                # Extraer palabras clave significativas del titulo (>=4 chars, no stopwords)
+                stops = {"the","a","an","de","del","la","el","los","las","you","not","can",
+                         "are","and","or","in","of","to","is","it","be","at","on","for"}
+                words = [w for w in re.sub(r'[^a-zA-Z0-9\s]', ' ', (title_en or query)).split()
+                         if len(w) >= 4 and w.lower() not in stops]
+                # Probar con menos palabras progresivamente
+                for n in range(len(words)-1, 0, -1):
+                    short_query = " ".join(words[:n])
+                    if len(short_query) < 3:
+                        continue
+                    print(f"[*] Busqueda progresiva: '{short_query}'")
+                    results = do_search(short_query, target_imdb=imdbid)
+                    if results:
+                        print(f"[*] Encontrado con query reducido: '{short_query}'")
+                        break
+        else:
+            results = do_search(query)
+            if year_str and title_en and title_en.lower() != query.lower():
+                year_found = any(year_str in " ".join([r.get("title","")] + r.get("ed2k_links",[])) for r in results)
+                if not year_found:
+                    print(f"[*] Sin resultados con año {year_str} en ES, reintentando EN: '{title_en}'")
+                    results_en = do_search(title_en)
+                    if results_en:
+                        results = results_en
 
         total = sum(len(r['ed2k_links']) for r in results)
         print(f"[OK] {total} enlaces ed2k antes de filtrar por titulo")
@@ -504,38 +653,70 @@ def api():
             results = filtered
         print(f"[OK] {sum(len(r['ed2k_links']) for r in results)} enlaces tras filtrar por titulo")
 
-        # Radarr se encarga de filtrar calidad según su Quality Profile.
-        # Aquí solo eliminamos basura real (subs, NFO, 3D, BSO, archivos <10MB).
-        SKIP_TERMS = ["3D.SBS", "3D.HOU", "HSBS", "HTAB", ".3D.", "BSO",
-                      ".SRT", ".RAR", ".NFO", ".TXT", "SUBTITULO", "MEDIAINFO"]
+        # Elegir UN SOLO release: mejor ratio calidad/tamano
+        # Prioridad: WEBDL > WEBRip > MicroHD > Bluray
+        # Dentro de misma prioridad: menor tamano en rango 1-8 GB
+        MAX_SIZE = 8 * 1024**3
+        MIN_SIZE = 1 * 1024**3
+        SRC_PRIORITY = {"WEBDL": 0, "WEBRip": 1, "MicroHD": 2, "Bluray": 3}
 
-        final_results = []
-        total_links = 0
+        def src_prio(src):
+            for k, v in SRC_PRIORITY.items():
+                if k.lower() in src.lower():
+                    return v
+            return 99
+
+        candidates = []
         for r in results:
-            valid_links = []
             for ed2k in r.get("ed2k_links", []):
                 fname = parse_fname(ed2k)
                 fname_upper = fname.upper()
-                size = parse_size(ed2k)
+                size  = parse_size(ed2k)
+                res, src = detect_quality(fname)
                 try:
                     sz = int(size)
                 except:
                     sz = 0
-                if any(t in fname_upper for t in SKIP_TERMS):
-                    print(f"  [SKIP] {fname[:55]} (3D/BSO/sub)")
-                    continue
-                if sz < 10 * 1024 * 1024:
-                    print(f"  [SKIP] {fname[:55]} (muy pequeno)")
-                    continue
-                _, src = detect_quality(fname)
-                print(f"  [OK] {fname[:55]} | {src} | {sz//1024//1024} MB")
-                valid_links.append(ed2k)
-                total_links += 1
-            if valid_links:
-                final_results.append({**r, "ed2k_links": valid_links})
 
-        results = final_results
-        print(f"[OK] {total_links} enlaces enviados a Radarr")
+                in_range = MIN_SIZE <= sz <= MAX_SIZE
+                res_prio = 0 if res == "1080p" else (1 if res == "720p" else 2)
+                candidates.append((src_prio(src), res_prio, sz, ed2k, r, in_range))
+
+        # Devolver todos los candidatos a Radarr — el indexer no decide, Radarr elige
+        if candidates:
+            candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+            results = []
+            for sp, rp, sz, ed2k, r, _ in candidates:
+                results.append({"title": r["title"], "url": r["url"], "ed2k_links": [ed2k]})
+                _, src_c = detect_quality(parse_fname(ed2k))
+                print(f"  [OK] {parse_fname(ed2k)[:55]} | {src_c} | {sz//1024//1024} MB")
+            print(f"[OK] {len(results)} candidatos devueltos a Radarr")
+        else:
+            # Sin candidatos — devolver todo incluyendo DVD para seleccion manual
+            all_links = []
+            for r in results:
+                for ed2k in r.get("ed2k_links", []):
+                    fname = parse_fname(ed2k)
+                    fname_upper = fname.upper()
+                    size = parse_size(ed2k)
+                    try:
+                        sz = int(size)
+                    except:
+                        sz = 0
+
+
+                    all_links.append((sz, ed2k, r))
+            if all_links:
+                all_links.sort(key=lambda x: x[0], reverse=True)
+                print(f"[OK] Devolviendo {len(all_links)} candidatos (sin 1080p) para seleccion manual")
+                results = []
+                for sz, ed2k, r in all_links:
+                    results.append({"title": r["title"], "url": r["url"], "ed2k_links": [ed2k]})
+                    _, src_c = detect_quality(parse_fname(ed2k))
+                    print(f"  [MANUAL] {parse_fname(ed2k)[:55]} | {src_c} | {sz//1024//1024} MB")
+            else:
+                results = []
+                print("[OK] Sin candidatos validos")
     except Exception as e:
         import traceback; traceback.print_exc()
         results = []
@@ -554,6 +735,8 @@ def build_xml_tv(episodes, show_title, year=""):
     ET.SubElement(ch, "title").text = "Hispashare ed2k"
     ET.SubElement(ch, "description").text = "Hispashare ed2k indexer"
     ET.SubElement(ch, "link").text = BASE
+    _off, _lim = page_args()
+    _items = []
 
     for season, ep, ed2k, fname in episodes:
         size  = parse_size(ed2k)
@@ -576,21 +759,21 @@ def build_xml_tv(episodes, show_title, year=""):
         enc.set("length", str(size))
         enc.set("type",   "application/x-bittorrent")
 
-        for name, val in [
-            ("category",  "5000"),
+        for name, val in ([("category", c) for c in cat_attrs(src, "5000", tv=True)] + [
             ("seeders",   "50"),
             ("peers",     "100"),
             ("size",      str(size)),
             ("quality",   src),
             ("season",    str(season)),
             ("episode",   str(ep)),
-        ]:
+        ]):
             a = ET.SubElement(item, "torznab:attr")
             a.set("name", name); a.set("value", val)
 
+        _items.append(item)
         print(f"[TV-XML] {title} | {src} | {int(size)//1024//1024} MB")
 
-    return ET.tostring(rss, encoding="unicode", xml_declaration=True)
+    return finish_feed(rss, ch, _items, _off, _lim)
 
 
 @app.route("/tvsearch")
@@ -599,19 +782,32 @@ def tvsearch_redirect():
     return api()
 
 
-def handle_tvsearch(query, tvdbid, season, episode):
+def handle_tvsearch(query, tvdbid, season, episode, imdbid=""):
     """Manejador principal para t=tvsearch de Sonarr."""
     from scraper_tv import get_season_episodes
 
     title_en = ""
     year_str = ""
-    imdbid   = ""
+
+    # Sin tvdbid pero con imdbid: resolver por IMDb
+    if imdbid and not tvdbid:
+        try:
+            j = http_json(f"https://api.themoviedb.org/3/find/tt{imdbid}?api_key={TMDB_KEY}&external_source=imdb_id&language=es-ES")
+            tv_results = j.get("tv_results", [])
+            if tv_results:
+                r0 = tv_results[0]
+                query     = r0.get("name", "").strip() or query
+                title_en  = r0.get("original_name", "").strip() or query
+                year_str  = (r0.get("first_air_date", "") or "")[:4]
+                print(f"[TV] TMDB imdb tt{imdbid} -> ES:'{query}' EN:'{title_en}' ({year_str})")
+        except Exception as e:
+            print(f"[WARN] TMDB TV imdb error: {e}")
 
     # Resolver serie via TMDB usando tvdbid
     if tvdbid:
         try:
-            find_url = f"https://api.themoviedb.org/3/find/{tvdbid}?api_key=TU_TMDB_API_KEY&external_source=tvdb_id&language=es-ES"
-            j = requests.get(find_url, timeout=5).json()
+            find_url = f"https://api.themoviedb.org/3/find/{tvdbid}?api_key={TMDB_KEY}&external_source=tvdb_id&language=es-ES"
+            j = http_json(find_url)
             tv_results = j.get("tv_results", [])
             if tv_results:
                 r0 = tv_results[0]
@@ -622,7 +818,7 @@ def handle_tvsearch(query, tvdbid, season, episode):
                 tmdb_id   = r0.get("id")
                 # Obtener IMDB ID
                 if tmdb_id:
-                    ext = requests.get(f"https://api.themoviedb.org/3/tv/{tmdb_id}/external_ids?api_key=TU_TMDB_API_KEY", timeout=5).json()
+                    ext = http_json(f"https://api.themoviedb.org/3/tv/{tmdb_id}/external_ids?api_key={TMDB_KEY}")
                     imdb_raw = ext.get("imdb_id", "")
                     if imdb_raw and imdb_raw.startswith("tt"):
                         imdbid = imdb_raw[2:]
@@ -635,8 +831,8 @@ def handle_tvsearch(query, tvdbid, season, episode):
     # Si no hay tvdbid, intentar traducir el query via TMDB
     if not tvdbid and query:
         try:
-            search_url = f"https://api.themoviedb.org/3/search/tv?api_key=TU_TMDB_API_KEY&query={requests.utils.quote(query)}&language=es-ES"
-            j = requests.get(search_url, timeout=5).json()
+            search_url = f"https://api.themoviedb.org/3/search/tv?api_key={TMDB_KEY}&query={requests.utils.quote(query)}&language=es-ES"
+            j = http_json(search_url)
             tv_results = j.get("results", [])
             if tv_results:
                 r0 = tv_results[0]
@@ -646,7 +842,7 @@ def handle_tvsearch(query, tvdbid, season, episode):
                 year_str  = release[:4] if release else ""
                 tmdb_id   = r0.get("id")
                 if tmdb_id:
-                    ext = requests.get(f"https://api.themoviedb.org/3/tv/{tmdb_id}/external_ids?api_key=TU_TMDB_API_KEY", timeout=5).json()
+                    ext = http_json(f"https://api.themoviedb.org/3/tv/{tmdb_id}/external_ids?api_key={TMDB_KEY}")
                     imdb_raw = ext.get("imdb_id", "")
                     if imdb_raw and imdb_raw.startswith("tt"):
                         imdbid = imdb_raw[2:]
@@ -656,7 +852,7 @@ def handle_tvsearch(query, tvdbid, season, episode):
         except Exception as e:
             print(f"[WARN] TMDB TV search error: {e}")
 
-    if not query and not tvdbid:
+    if not query and not tvdbid and not imdbid:
         dummy = build_xml_tv(
             [(1, 1, "ed2k://|file|Test.S01E01.mkv|1000000000|AABBCCDDEEFF00112233445566778899|/", "Test.S01E01.mkv")],
             "Test Show", "2020"
@@ -927,44 +1123,6 @@ def transmission():
 
 _emule_session = {"ses": None}
 
-# Ruta al ejecutable de eMule en el HOST (se pasa como variable de entorno).
-# Si no está definida, el reinicio automático se desactiva y solo se loguea el error.
-EMULE_EXE = os.environ.get("EMULE_EXE", r"C:\Program Files (x86)\eMule\emule.exe")
-
-
-def _emule_is_alive() -> bool:
-    """Comprueba si la WebInterface de eMule responde. Timeout muy corto."""
-    try:
-        resp = requests.get(f"http://{EMULE_HOST}:{EMULE_PORT}/", timeout=4)
-        return resp.status_code == 200
-    except Exception:
-        return False
-
-
-def _emule_restart_host() -> bool:
-    """
-    Reinicia eMule en el host Windows vía subprocess.
-    Solo funciona si el indexer corre directamente en el host (no en Docker).
-    Si corre en Docker, este llamada fallará silenciosamente y se loguea.
-    """
-    import subprocess, time
-    try:
-        subprocess.run(["taskkill", "/F", "/IM", "emule.exe"],
-                       capture_output=True, timeout=10)
-        time.sleep(4)
-        subprocess.Popen([EMULE_EXE])
-        print(f"[eMule] Reiniciado: {EMULE_EXE}")
-        time.sleep(15)  # Esperar a que la WebInterface arranque
-        return True
-    except FileNotFoundError:
-        print("[eMule] No se puede reiniciar desde Docker (taskkill no disponible). "
-              "Configura emule_restart.py en el host para reinicio automático.")
-        return False
-    except Exception as e:
-        print(f"[eMule] Error al reiniciar: {e}")
-        return False
-
-
 def _emule_login():
     """Hace login en la WebInterface de eMule y devuelve el session ID."""
     emule_pass = os.environ.get("EMULE_PASS", "")
@@ -1003,28 +1161,11 @@ def _emule_login():
         print(f"[eMule] Login error: {e}")
         return False
 
-
 def _emule_send_ed2k(ed2k):
-    """
-    Manda un enlace ed2k a eMule via WebInterface.
-    Si la WebInterface no responde, intenta reiniciar eMule y reintenta una vez.
-    """
+    """Manda un enlace ed2k a eMule via WebInterface."""
     base = f"http://{EMULE_HOST}:{EMULE_PORT}"
-
-    # 1. Comprobar si eMule está vivo antes de intentar enviar
-    if not _emule_is_alive():
-        print("[eMule] WebInterface no responde, intentando reiniciar...")
-        _emule_restart_host()
-        # Tras reiniciar, reset de sesión para forzar re-login
-        _emule_session["ses"] = None
-        if not _emule_is_alive():
-            print("[eMule] Sigue sin responder tras reinicio. Se reintentará en el próximo ciclo.")
-            return False
-
-    # 2. Login si no hay sesión activa
     if not _emule_session["ses"]:
         _emule_login()
-
     try:
         url = f"{base}/?ses={_emule_session['ses']}&w=transfer&ed2k={requests.utils.quote(ed2k, safe='')}"
         print(f"[eMule] Enviando: {url[:120]}")
@@ -1042,68 +1183,228 @@ def _emule_send_ed2k(ed2k):
     except Exception as e:
         print(f"[eMule] Error enviando ed2k: {e}")
         return False
+
+
+RADARR_URL     = "http://radarr:7878"
+RADARR_API_KEY = "c513394977184bcda278a811a9268a46"
+
+
+def _guess_via_radarr(fname):
+    """Fallback: consulta Radarr por título aproximado cuando TMDB falla."""
+    name = os.path.splitext(fname)[0]
+    ext  = os.path.splitext(fname)[1].lower()
+    _, src = detect_quality(fname)
+
+    clean = re.sub(r'\.(?!\d)', ' ', name).replace('_', ' ')
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    q_m = re.search(r'\b(1080p|720p|2160p|BDRip|WEBRip|WEBDL|WEB-DL|BluRay|MicroHD|XviD|x264|x265)\b', clean, re.I)
+    raw = clean[:q_m.start()].strip().rstrip('.-') if q_m else clean
+    raw = re.sub(r'\s*\((?:19|20)\d{2}\)\s*', ' ', raw).strip()
+    raw = re.sub(r'\s*\([^)]+\)\s*', ' ', raw).strip()
+    raw = re.sub(r'\s+', ' ', raw).strip()
+    if len(raw) < 2:
+        return None
+
+    try:
+        movies = requests.get(f"{RADARR_URL}/api/v3/movie",
+                              headers={"X-Api-Key": RADARR_API_KEY},
+                              timeout=5).json()
+        raw_words = set(re.sub(r'[^a-z0-9\s]', ' ', raw.lower()).split())
+        best, best_score = None, 0
+        for movie in movies:
+            title = movie.get('title', '')
+            year  = str(movie.get('year', ''))
+            t_words = set(re.sub(r'[^a-z0-9\s]', ' ', title.lower()).split())
+            score = len(raw_words & t_words)
+            if score > best_score:
+                best_score = score
+                best = (title, year)
+        if best and best_score >= 2:
+            safe_title = re.sub(r'[\\/*?:"<>|]', '_', best[0])
+            new_name = f"{safe_title} ({best[1]}) {src}{ext}"
+            print(f"[Watcher] Radarr identificó: '{best[0]}' (score={best_score})")
+            return new_name
+    except Exception as e:
+        print(f"[Watcher] Radarr API error: {e}")
+    return None
+
+
+def _guess_radarr_fname(fname):
     """
-    Vigila /downloads cada 30s. Cuando aparece un archivo nuevo,
-    busca si coincide con algún torrent registrado y lo renombra
-    al nombre que Radarr puede importar automáticamente.
+    Intenta identificar un archivo via TMDB y devuelve el nombre
+    que Radarr puede importar automáticamente, o None si no puede.
+    Funciona tanto para películas (sin SxEE) como para series (con SxEE).
     """
-    import time, os
-    print("[Watcher] Iniciado, vigilando /downloads...")
-    seen = set()
-    while True:
+    pass  # TMDB_KEY global (entorno)
+    name = os.path.splitext(fname)[0]
+    ext  = os.path.splitext(fname)[1].lower()
+
+    # Detectar si es episodio de serie
+    ep_m = re.search(r'(\d{1,2})[xX](\d{2})|[Ss](\d{1,2})[Ee](\d{2})', fname)
+
+    # Limpiar nombre: puntos → espacios, quitar tags
+    clean = re.sub(r'\.(?!\d)', ' ', name).replace('_', ' ')
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    # Quitar desde el marcador de episodio o calidad en adelante
+    cutoff = ep_m.start() if ep_m else None
+    if not cutoff:
+        q_m = re.search(r'\b(1080p|720p|2160p|BDRip|WEBRip|WEBDL|WEB-DL|BluRay|MicroHD|XviD|x264|x265)\b', clean, re.I)
+        cutoff = q_m.start() if q_m else None
+    raw_title = clean[:cutoff].strip().rstrip('.-') if cutoff else clean
+
+    # Quitar año entre paréntesis si está pegado al título
+    year_m = re.search(r'\(((?:19|20)\d{2})\)', raw_title)
+    year = year_m.group(1) if year_m else ""
+    if year_m:
+        raw_title = raw_title[:year_m.start()].strip()
+    if not year:
+        year_m2 = re.search(r'\b((?:19|20)\d{2})\b', clean)
+        year = year_m2.group(1) if year_m2 else ""
+
+    # Quitar subtítulos tras punto/dos puntos para mejorar búsqueda
+    if ':' in raw_title:
+        raw_title = raw_title.split(':')[-1].strip()
+    elif '. ' in raw_title:
+        parts = raw_title.split('. ')
+        raw_title = min(parts, key=len).strip()
+
+    raw_title = re.sub(r'\s+', ' ', raw_title).strip()
+    if len(raw_title) < 2:
+        return None
+
+    _, src = detect_quality(fname)
+
+    if ep_m:
+        # Es serie — buscar en TMDB TV
+        season  = int(ep_m.group(1) or ep_m.group(3))
+        episode = int(ep_m.group(2) or ep_m.group(4))
         try:
-            if os.path.exists(DOWNLOADS_DIR):
-                current = set(os.listdir(DOWNLOADS_DIR))
-                new_files = current - seen
-                for fname in new_files:
-                    if fname.endswith(('.mkv', '.mp4', '.avi')):
-                        print(f"[Watcher] Nuevo archivo: {fname[:60]}")
-                        # Buscar en torrents registrados
-                        with _torrents_lock:
-                            for h, t in list(_torrents.items()):
-                                if t['fname'].lower() == fname.lower():
-                                    radarr_fname = t.get('radarr_fname')
-                                    if radarr_fname and radarr_fname != fname:
-                                        src = os.path.join(DOWNLOADS_DIR, fname)
-                                        dst = os.path.join(DOWNLOADS_DIR, radarr_fname)
-                                        if not os.path.exists(dst):
-                                            os.rename(src, dst)
-                                            print(f"[Watcher] Renombrado: {fname[:50]} -> {radarr_fname[:50]}")
-                                    break
-                seen = current
+            for lang in ['en-US', 'es-ES']:
+                r = requests.get('https://api.themoviedb.org/3/search/tv',
+                                 params={'api_key': TMDB_KEY, 'query': raw_title, 'language': lang},
+                                 timeout=5).json()
+                results = r.get('results', [])
+                if results:
+                    res   = results[0]
+                    title = res.get('name') or res.get('original_name', '')
+                    d     = res.get('first_air_date', '')
+                    y     = d[:4] if d else year
+                    if lang == 'es-ES' and title:
+                        # Obtener título en inglés
+                        r2 = requests.get(f"https://api.themoviedb.org/3/tv/{res['id']}",
+                                          params={'api_key': TMDB_KEY, 'language': 'en-US'},
+                                          timeout=5).json()
+                        title = r2.get('name') or r2.get('original_name', title)
+                        d2 = r2.get('first_air_date', '')
+                        y  = d2[:4] if d2 else y
+                    safe_title = re.sub(r'[\\/*?:"<>|]', '_', title)
+                    new_name = f"{safe_title} ({y}) S{season:02d}E{episode:02d} {src}{ext}" if y else \
+                               f"{safe_title} S{season:02d}E{episode:02d} {src}{ext}"
+                    return new_name
         except Exception as e:
-            print(f"[Watcher] Error: {e}")
-        time.sleep(30)
+            print(f"[Watcher] TMDB TV error: {e}")
+    else:
+        # Es película — buscar en TMDB Movies
+        try:
+            for lang in ['en-US', 'es-ES']:
+                params = {'api_key': TMDB_KEY, 'query': raw_title, 'language': 'en-US'}
+                if year:
+                    params['year'] = year
+                r = requests.get('https://api.themoviedb.org/3/search/movie',
+                                 params=params, timeout=5).json()
+                results = r.get('results', [])
+                if not results and year:
+                    params.pop('year')
+                    r = requests.get('https://api.themoviedb.org/3/search/movie',
+                                     params=params, timeout=5).json()
+                    results = r.get('results', [])
+                if results:
+                    res   = results[0]
+                    title = res.get('title') or res.get('original_title', '')
+                    d     = res.get('release_date', '')
+                    y     = d[:4] if d else year
+                    safe_title = re.sub(r'[\\/*?:"<>|]', '_', title)
+                    new_name = f"{safe_title} ({y}) {src}{ext}"
+                    return new_name
+                if lang == 'en-US':
+                    # Reintentar buscando en español
+                    params['language'] = 'es-ES'
+                    r2 = requests.get('https://api.themoviedb.org/3/search/movie',
+                                      params=params, timeout=5).json()
+                    results2 = r2.get('results', [])
+                    if results2:
+                        tmdb_id = results2[0].get('id')
+                        r3 = requests.get(f"https://api.themoviedb.org/3/movie/{tmdb_id}",
+                                          params={'api_key': TMDB_KEY, 'language': 'en-US'},
+                                          timeout=5).json()
+                        title = r3.get('title') or r3.get('original_title', '')
+                        d     = r3.get('release_date', '')
+                        y     = d[:4] if d else year
+                        safe_title = re.sub(r'[\\/*?:"<>|]', '_', title)
+                        new_name = f"{safe_title} ({y}) {src}{ext}"
+                        return new_name
+        except Exception as e:
+            print(f"[Watcher] TMDB movie error: {e}")
+
+    return None
 
 
 def _incoming_watcher():
     """
-    Vigila /downloads cada 30s. Cuando aparece un archivo nuevo,
-    busca si coincide con algún torrent registrado y lo renombra
-    al nombre que Radarr puede importar automáticamente.
+    Vigila /downloads cada 30s. Cuando aparece un archivo nuevo:
+    1. Busca en torrents.json si tiene el nombre radarr ya calculado
+    2. Si no, lo identifica via TMDB por el nombre del archivo
+    3. Renombra al nombre correcto para Radarr/Sonarr
+    Funciona aunque el container se haya reiniciado.
     """
     import time, os
     print("[Watcher] Iniciado, vigilando /downloads...")
+    # Al arrancar escanear todo Incoming, no solo archivos nuevos
     seen = set()
+    first_run = True
     while True:
         try:
             if os.path.exists(DOWNLOADS_DIR):
                 current = set(os.listdir(DOWNLOADS_DIR))
-                new_files = current - seen
-                for fname in new_files:
-                    if fname.endswith(('.mkv', '.mp4', '.avi')):
-                        print(f"[Watcher] Nuevo archivo: {fname[:60]}")
-                        with _torrents_lock:
-                            for h, t in list(_torrents.items()):
-                                if t['fname'].lower() == fname.lower():
-                                    radarr_fname = t.get('radarr_fname')
-                                    if radarr_fname and radarr_fname != fname:
-                                        src = os.path.join(DOWNLOADS_DIR, fname)
-                                        dst = os.path.join(DOWNLOADS_DIR, radarr_fname)
-                                        if not os.path.exists(dst):
-                                            os.rename(src, dst)
-                                            print(f"[Watcher] Renombrado: {fname[:50]} -> {radarr_fname[:50]}")
-                                    break
+                # En el primer arranque procesar todos los archivos existentes
+                to_process = current if first_run else (current - seen)
+                first_run = False
+
+                for fname in to_process:
+                    if not fname.endswith(('.mkv', '.mp4', '.avi')):
+                        continue
+                    fpath = os.path.join(DOWNLOADS_DIR, fname)
+
+                    # Paso 1: buscar en torrents registrados
+                    radarr_fname = None
+                    with _torrents_lock:
+                        for h, t in list(_torrents.items()):
+                            if t['fname'].lower() == fname.lower():
+                                radarr_fname = t.get('radarr_fname')
+                                break
+
+                    # Paso 2: si no hay entrada, identificar via TMDB
+                    if not radarr_fname:
+                        print(f"[Watcher] Sin registro para '{fname[:55]}', identificando via TMDB...")
+                        radarr_fname = _guess_radarr_fname(fname)
+                        if radarr_fname:
+                            print(f"[Watcher] TMDB identificó: {radarr_fname[:60]}")
+                        else:
+                            # Fallback a Radarr API
+                            radarr_fname = _guess_via_radarr(fname)
+                            if not radarr_fname:
+                                print(f"[Watcher] No se pudo identificar: {fname[:55]}")
+
+                    # Paso 3: renombrar si el nombre es diferente
+                    if radarr_fname and radarr_fname != fname:
+                        dst = os.path.join(DOWNLOADS_DIR, radarr_fname)
+                        if not os.path.exists(dst):
+                            try:
+                                os.rename(fpath, dst)
+                                print(f"[Watcher] Renombrado: {fname[:45]} -> {radarr_fname[:45]}")
+                            except Exception as e:
+                                print(f"[Watcher] Error renombrando: {e}")
+
                 seen = current
         except Exception as e:
             print(f"[Watcher] Error: {e}")
@@ -1148,6 +1449,7 @@ def _ed2k_watcher():
 
 if __name__ == "__main__":
     import threading
+    threading.Thread(target=_rss_loop, daemon=True).start()
     threading.Thread(target=_incoming_watcher, daemon=True).start()
     threading.Thread(target=_ed2k_watcher, daemon=True).start()
     port = int(os.environ.get("PORT", 8085))

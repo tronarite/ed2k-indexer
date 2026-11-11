@@ -1,8 +1,8 @@
 """
-Indexer TV scraper
+Hispashare TV scraper
 Extrae episodios de series organizados por temporada y calidad.
 
-Estructura de Indexer para series:
+Estructura de Hispashare para series:
 - Una página por serie con todos los episodios
 - Cada bloque h2 = una calidad (WEBRip 1080p, BDRip 1080p, Micro4K...)
 - Dentro de cada bloque, episodios de una o varias temporadas
@@ -19,7 +19,8 @@ from scraper import fetch_ed2k, get_imdb_id, BASE
 EP_PATTERN = re.compile(r'(\d+)[xX](\d+)|[Ss](\d+)[Ee](\d+)')
 
 # Calidades a filtrar (no queremos estas)
-SKIP_QUALITY = re.compile(r'2160|4K|Micro4K|UHD|BSO|\.rar|\.srt|\.nfo|\.txt', re.I)
+SKIP_QUALITY = re.compile(r'BSO|\.rar|\.srt|\.nfo|\.txt', re.I)
+FOURK_QUALITY = re.compile(r'2160|4K|Micro4K|UHD', re.I)
 SKIP_FNAME   = re.compile(r'BSO|\.rar|\.srt|\.nfo|\.txt|SUBTITULO|MEDIAINFO', re.I)
 
 # Prioridad de fuente (menor = mejor), igual que películas
@@ -77,6 +78,8 @@ def get_series_page(session, url):
         if SKIP_QUALITY.search(h2_text):
             continue
 
+        is4k = bool(FOURK_QUALITY.search(h2_text))
+
         # Recoger episodios de este bloque
         parent = h2.find_parent()
         episodes = {}  # (season, ep) -> [(eid, code, fname)]
@@ -99,12 +102,13 @@ def get_series_page(session, url):
             key = (season, ep)
             if key not in episodes:
                 episodes[key] = []
-            episodes[key].append((eid, code, fname))
+            episodes[key].append((eid, code, fname + (' 2160p' if is4k else '')))
 
         if episodes:
             bloques.append({
                 'quality': h2_text,
                 'src_prio': src_prio(h2_text),
+                'is4k': is4k,
                 'episodes': episodes,
             })
 
@@ -123,12 +127,17 @@ def get_season_episodes(session, url, season):
         print(f'[TV] Sin bloques encontrados en {url}')
         return imdb_id, []
 
-    # Filtrar bloques que tengan episodios de la temporada pedida
-    bloques_validos = [b for b in bloques if any(s == season for s, e in b['episodes'])]
+    # Sin 4K salvo que sea lo unico disponible
+    sin4k = [b for b in bloques if not b.get('is4k')]
 
-    if not bloques_validos:
-        # Si no hay bloque específico, buscar bloque con toda la serie (muchas temporadas)
-        bloques_validos = [b for b in bloques if len(set(s for s, e in b['episodes'])) > 1]
+    def validos(lista):
+        v = [b for b in lista if any(s == season for s, e in b['episodes'])]
+        if not v:
+            # Si no hay bloque específico, buscar bloque con toda la serie (muchas temporadas)
+            v = [b for b in lista if len(set(s for s, e in b['episodes'])) > 1]
+        return v
+
+    bloques_validos = validos(sin4k) or validos(bloques)
 
     if not bloques_validos:
         print(f'[TV] No hay episodios para temporada {season}')
